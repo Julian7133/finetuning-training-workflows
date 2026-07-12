@@ -1,0 +1,14 @@
+2026-07-12 09:00:48,394 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/andjiang/CoPaw-Flash-9B-oQ4/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 36578.23it/s]
+2026-07-12 09:00:53,368 INFO __main__: Running: /Users/julianberlow/dev/Finetuning-data-workflows/llm-usage-extract/.venv/bin/python3 /Users/julianberlow/dev/Finetuning-training-workflows/train_runner.py -c output/lora_config.yaml
+Loading configuration file output/lora_config.yaml
+Loading pretrained model
+Fetching 8 files:   0%|          | 0/8 [00:00<?, ?it/s]Fetching 8 files: 100%|██████████| 8/8 [00:00<00:00, 14926.35it/s]
+Loading datasets
+Training
+Trainable parameters: 0.242% (21.639M/8953.802M)
+Starting training..., iters: 978 (train_runner manual-BPTT engine, delta_chunk=128, ce_chunk=1024)
+Calculating loss...:   0%|          | 0/8 [00:00<?, ?it/s]Calculating loss...:  12%|█▎        | 1/8 [00:21<02:31, 21.64s/it]Calculating loss...:  25%|██▌       | 2/8 [00:50<02:33, 25.60s/it]Calculating loss...:  38%|███▊      | 3/8 [00:59<01:32, 18.40s/it]Calculating loss...:  50%|█████     | 4/8 [01:10<01:01, 15.38s/it]Calculating loss...:  62%|██████▎   | 5/8 [01:21<00:41, 13.73s/it]Calculating loss...:  75%|███████▌  | 6/8 [01:27<00:22, 11.01s/it]Calculating loss...:  88%|████████▊ | 7/8 [01:36<00:10, 10.57s/it]Calculating loss...: 100%|██████████| 8/8 [02:11<00:00, 18.35s/it]Calculating loss...: 100%|██████████| 8/8 [02:11<00:00, 16.48s/it]
+Iter 1: Val loss 1.401, Val took 131.880s
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py:475: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-7ziaihez'}
+  warnings.warn(

@@ -1,0 +1,26 @@
+2026-07-12 09:05:04,182 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/andjiang/CoPaw-Flash-9B-oQ4/revision/main "HTTP/1.1 200 OK"
+Fetching 6 files:   0%|          | 0/6 [00:00<?, ?it/s]Fetching 6 files: 100%|██████████| 6/6 [00:00<00:00, 19800.02it/s]
+2026-07-12 09:05:09,429 INFO __main__: Running canary (3 iters): /Users/julianberlow/dev/Finetuning-data-workflows/llm-usage-extract/.venv/bin/python3 /Users/julianberlow/dev/Finetuning-training-workflows/train_runner.py -c output/lora_config_canary.yaml
+Loading configuration file output/lora_config_canary.yaml
+Loading pretrained model
+Fetching 8 files:   0%|          | 0/8 [00:00<?, ?it/s]Fetching 8 files: 100%|██████████| 8/8 [00:00<00:00, 8071.79it/s]
+Loading datasets
+Training
+Trainable parameters: 0.242% (21.639M/8953.802M)
+Starting training..., iters: 3 (train_runner manual-BPTT engine, delta_chunk=128, ce_chunk=1024)
+Calculating loss...:   0%|          | 0/3 [00:00<?, ?it/s]Calculating loss...:  33%|███▎      | 1/3 [01:09<02:18, 69.30s/it]Calculating loss...:  67%|██████▋   | 2/3 [02:38<01:20, 80.93s/it]Calculating loss...: 100%|██████████| 3/3 [04:14<00:00, 87.70s/it]Calculating loss...: 100%|██████████| 3/3 [04:14<00:00, 84.71s/it]
+Iter 1: Val loss 1.237, Val took 254.154s
+Calculating loss...:   0%|          | 0/3 [00:00<?, ?it/s]Calculating loss...:  33%|███▎      | 1/3 [01:30<03:00, 90.07s/it]Calculating loss...:  67%|██████▋   | 2/3 [03:00<01:30, 90.43s/it]Calculating loss...: 100%|██████████| 3/3 [04:27<00:00, 88.65s/it]Calculating loss...: 100%|██████████| 3/3 [04:27<00:00, 89.09s/it]
+Iter 3: Val loss 1.237, Val took 267.307s
+Iter 3: Train loss 1.237, Learning Rate 1.000e-04, It/sec 0.004, Tokens/sec 34.780, Trained Tokens 24350, Peak mem 16.421 GB
+Saved final weights to output/adapters/_canary/adapters.safetensors.
+Domain episodes accepted: 577 (train 519 / eval 58, random split, seed=0)
+Replay merged: 71/154 (target ratio 0.12)
+Dropped for exceeding max_seq_length=8192: 101 train, 9 eval
+Wrote 489 train rows, 49 eval rows to output/mlx_data
+Wrote LoRA config to output/lora_config.yaml (iters=978, ~2.0 epochs)
+Canary ran the 3 longest training examples (shortest of them: 8080 tokens) -- a worst-case-length probe, not a representative-average sample.
+Canary peak RSS: 18.00 GB
+oMLX ceiling on this M3: soft=17.8GB hard=19.9GB ceil=21.0GB
+Above the soft limit but under hard/ceil. This is close enough to the limit that was previously followed by a system freeze when raised -- recommend a lower max_seq_length (e.g. 24576) rather than proceeding at 32768.
+Canary-only: not running the full training. Re-run without --canary-only once satisfied.
