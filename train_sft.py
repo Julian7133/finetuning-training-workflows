@@ -1,4 +1,8 @@
-"""Build the LoRA training data split and run `mlx_lm.lora` SFT training.
+"""Build the LoRA training data split and run SFT training.
+
+Default backend is mlx-lm-lora (https://github.com/Goekdeniz-Guelmez/mlx-lm-lora)
+with efficient long-context chunking for speed. Use --backend manual to fall back
+to train_runner.py (custom manual-BPTT engine for GatedDeltaNet memory limits).
 
 Consumes the data pipeline's judge results + filtered replay pool from the
 sibling `Finetuning-data-workflows/llm-usage-extract` repo (Plan v2 Stage 3 /
@@ -20,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import subprocess
 import sys
@@ -30,13 +35,13 @@ from pathlib import Path
 
 import yaml
 
-# Configured oMLX memory ceiling on the target M3 is tighter than the full
-# 24GB unified memory pool (soft=17.8GB, hard=19.9GB, ceil=21.0GB) -- a prior
-# run that pushed the ceiling higher froze the system. Canary runs compare
-# observed peak RSS against these, not the theoretical 24GB.
+# Memory budget aligned with sysctl iogpu.wired_limit_mb=20528 (~20.05 GB).
+# Prior setting 22528 (~22 GB) preceded system freezes. Canary guard kills at
+# the wired ceiling; soft/hard are the older oMLX advisory thresholds.
+OMLX_WIRED_LIMIT_MB = 20528
 OMLX_SOFT_LIMIT_GB = 17.8
 OMLX_HARD_LIMIT_GB = 19.9
-OMLX_CEILING_GB = 21.0
+OMLX_CEILING_GB = OMLX_WIRED_LIMIT_MB / 1024
 
 from chatml import render_chatml
 
@@ -48,7 +53,14 @@ DEFAULT_MODEL = "andjiang/CoPaw-Flash-9B-oQ4"
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build the SFT+replay train/eval split and run mlx_lm.lora."
+        description="Build the SFT+replay train/eval split and run LoRA SFT training."
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("mlx-lm-lora", "manual"),
+        default="mlx-lm-lora",
+        help="Training engine: mlx-lm-lora (default, faster via efficient long context) "
+        "or manual (train_runner.py custom backprop for worst-case memory safety).",
     )
     parser.add_argument(
         "--pipeline-root",
@@ -75,31 +87,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=32768,
+        default=4096,
         help="Examples tokenizing longer than this are dropped (not truncated) before training. "
-        "32768 covers 95.8pct of domain episodes (553/577); the 24 dropped are the true "
-        "outlier tail (p99=78455, max=142392). 16384 would cover only 88.7pct and "
-        "disproportionately drops the highest-tool-call-density trajectories (~3.8x the "
-        "average tool-call count) -- exactly the examples this fine-tune cares most about.",
+        "4096 is the mlx-lm-lora default on 24GB (Option B). Use 8192+ with --backend manual "
+        "for worst-case long trajectories; 32768 covers 95.8pct of domain episodes but does "
+        "not fit mlx-lm-lora on CoPaw 9B here.",
     )
     parser.add_argument(
         "--num-layers",
         type=int,
-        default=-1,
+        default=16,
         help="Number of transformer blocks (from the end) to LoRA-adapt; -1 = all 32. "
-        "mlx_lm's own default is 16 (last half only). -1 was our initial choice reading "
-        "the plan's 'all-linear' as full-depth too, which combined with grad_checkpoint "
-        "may be what triggered a Metal resource-count crash during canary testing.",
+        "16 (last half) is the stable default on 24GB; -1 + grad_checkpoint triggered "
+        "Metal resource-limit crashes during early canary testing.",
     )
     parser.add_argument(
         "--grad-checkpoint",
         dest="grad_checkpoint",
         action="store_true",
-        default=True,
-        help="Gradient checkpointing (default on). Trades peak memory for more live Metal "
-        "resources per step (recompute graphs) -- implicated in the canary resource-limit crash.",
+        default=None,
+        help="Gradient checkpointing. Default: off for mlx-lm-lora (uses efficient long "
+        "context instead), on for manual backend.",
     )
     parser.add_argument("--no-grad-checkpoint", dest="grad_checkpoint", action="store_false")
+    parser.add_argument(
+        "--efficient-long-context",
+        dest="efficient_long_context",
+        action="store_true",
+        default=None,
+        help="mlx-lm-lora only: process long sequences in 512-token cached chunks "
+        "(major speed win vs manual backend). Default on for mlx-lm-lora backend.",
+    )
+    parser.add_argument(
+        "--seq-step-size",
+        type=int,
+        default=256,
+        help="mlx-lm-lora only: token chunk size for efficient long context (stock "
+        "mlx-lm-lora uses 512; 256 is safer on CoPaw GatedDeltaNet at 8192 tokens). "
+        "Passed via COPAW_SEQ_STEP_SIZE to mlx_lora_runner.py.",
+    )
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument(
         "--alpha",
@@ -142,13 +168,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--data-dir", default="output/mlx_data")
     parser.add_argument("--adapter-path", default="output/adapters")
-    parser.add_argument("--config-out", default="output/lora_config.yaml")
-    parser.add_argument("--dry-run", action="store_true", help="Build the split + config, skip mlx_lm.lora")
+    parser.add_argument("--config-out", default=None, help="LoRA YAML path (default depends on --backend)")
+    parser.add_argument("--dry-run", action="store_true", help="Build the split + config, skip training")
     parser.add_argument(
         "--canary-only",
         action="store_true",
         help="Run only a short burst (see --canary-iters) with RSS memory polling, report peak "
-        "memory against the oMLX ceiling (soft 17.8GB/hard 19.9GB/ceil 21.0GB), then exit "
+        "memory against the wired limit (sysctl iogpu.wired_limit_mb, default 20528), then exit "
         "without running the full training. Use this before a full run at a new max_seq_length.",
     )
     parser.add_argument(
@@ -164,7 +190,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="RSS sampling interval during --canary-only",
     )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARN", "ERROR"])
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.grad_checkpoint is None:
+        # Match mlx-lm-lora example notebooks (grad_checkpoint=True) and Plan v4.
+        args.grad_checkpoint = True
+    if args.efficient_long_context is None:
+        args.efficient_long_context = args.backend == "mlx-lm-lora"
+    if args.config_out is None:
+        args.config_out = (
+            "output/lora_mlx_lora_config.yaml"
+            if args.backend == "mlx-lm-lora"
+            else "output/lora_config.yaml"
+        )
+    return args
 
 
 @dataclass(frozen=True)
@@ -308,10 +346,14 @@ def write_jsonl(rows: list[dict], path: Path) -> int:
 
 
 def build_lora_config(args: argparse.Namespace, data_dir: Path, iters: int) -> dict:
-    return {
+    lora_parameters = {
+        "rank": args.rank,
+        "scale": args.alpha / args.rank,
+        "dropout": args.dropout,
+    }
+    common = {
         "model": args.model,
         "train": True,
-        "fine_tune_type": "lora",
         "data": str(data_dir),
         "seed": args.seed,
         "num_layers": args.num_layers,
@@ -325,12 +367,25 @@ def build_lora_config(args: argparse.Namespace, data_dir: Path, iters: int) -> d
         "save_every": args.save_every,
         "max_seq_length": args.max_seq_length,
         "grad_checkpoint": args.grad_checkpoint,
+        "lora_parameters": lora_parameters,
+    }
+    if args.backend == "mlx-lm-lora":
+        cfg = {
+            **common,
+            "train_type": "lora",
+            "train_mode": "sft",
+            "optimizer": "adamw",
+            "gradient_accumulation_steps": args.grad_accumulation_steps,
+            "efficient_long_context": args.efficient_long_context,
+            "fuse": False,
+        }
+        if args.efficient_long_context:
+            cfg["seq_step_size"] = args.seq_step_size
+        return cfg
+    return {
+        **common,
+        "fine_tune_type": "lora",
         "grad_accumulation_steps": args.grad_accumulation_steps,
-        "lora_parameters": {
-            "rank": args.rank,
-            "scale": args.alpha / args.rank,
-            "dropout": args.dropout,
-        },
     }
 
 
@@ -353,21 +408,20 @@ def find_latest_checkpoint(adapter_path: Path) -> tuple[Path, int] | None:
 
 
 TRAIN_RUNNER = Path(__file__).resolve().parent / "train_runner.py"
+MLX_LORA_RUNNER = Path(__file__).resolve().parent / "mlx_lora_runner.py"
 
 
-def _runner_cmd(config_path: Path) -> list[str]:
-    """train_runner.py wraps mlx_lm.lora with the memory patches this model
-    needs on 24GB (time-chunked GatedDeltaNet backward, chunked 248k-vocab CE,
-    clamped wired limit). Calling `mlx_lm lora` directly reproduces the
-    ~21GB+ first-backward peak regardless of max_seq_length."""
+def _runner_cmd(config_path: Path, backend: str) -> list[str]:
+    if backend == "mlx-lm-lora":
+        return [sys.executable, str(MLX_LORA_RUNNER), "-c", str(config_path)]
     return [sys.executable, str(TRAIN_RUNNER), "-c", str(config_path)]
 
 
-def run_with_memory_guard(cmd: list[str], poll_seconds: float = 1.0) -> tuple[int, float | None, bool]:
+def run_with_memory_guard(cmd: list[str], poll_seconds: float = 1.0, env: dict | None = None) -> tuple[int, float | None, bool]:
     """Run cmd while polling phys_footprint_peak; kill at the oMLX ceiling
     (raising past it froze the system before). Returns (returncode,
     peak_gb_observed, killed_by_guard)."""
-    proc = subprocess.Popen(cmd)
+    proc = subprocess.Popen(cmd, env=env)
     samples: list[float] = []
     killed = threading.Event()
     stop = threading.Event()
@@ -396,10 +450,17 @@ def run_with_memory_guard(cmd: list[str], poll_seconds: float = 1.0) -> tuple[in
     return returncode, (max(samples) if samples else None), killed.is_set()
 
 
-def run_training(config_path: Path) -> int:
-    cmd = _runner_cmd(config_path)
-    logger.info("Running: %s", " ".join(cmd))
-    returncode, peak_gb, killed = run_with_memory_guard(cmd)
+def _training_env(args: argparse.Namespace) -> dict:
+    env = os.environ.copy()
+    if args.backend == "mlx-lm-lora":
+        env["COPAW_SEQ_STEP_SIZE"] = str(args.seq_step_size)
+    return env
+
+
+def run_training(config_path: Path, backend: str, args: argparse.Namespace) -> int:
+    cmd = _runner_cmd(config_path, backend)
+    logger.info("Running (%s): %s", backend, " ".join(cmd))
+    returncode, peak_gb, killed = run_with_memory_guard(cmd, env=_training_env(args))
     if peak_gb is not None:
         logger.info("Training peak phys_footprint: %.2f GB", peak_gb)
     if killed:
@@ -451,7 +512,12 @@ def longest_rows(rows: list[dict], tokenizer, count: int) -> list[dict]:
 
 
 def run_canary(
-    config_path: Path, canary_rows: list[dict], canary_iters: int, poll_seconds: float
+    config_path: Path,
+    canary_rows: list[dict],
+    canary_iters: int,
+    poll_seconds: float,
+    backend: str,
+    args: argparse.Namespace,
 ) -> float | None:
     with config_path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -464,6 +530,7 @@ def run_canary(
     config["iters"] = min(canary_iters, len(canary_rows))
     config["adapter_path"] = str(Path(config["adapter_path"]) / "_canary")
     config["save_every"] = canary_iters + 1  # don't bother checkpointing a throwaway run
+    config["steps_per_eval"] = canary_iters + 1  # skip validation during canary
     # val_batches=-1 (the real config's setting) evaluates the ENTIRE valid set --
     # here that's all `canary_rows` again, which turns a "quick 20-iter probe"
     # into 20 more near-max-length forward passes on top of training. Cap it.
@@ -473,9 +540,11 @@ def run_canary(
     with canary_config_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
 
-    cmd = _runner_cmd(canary_config_path)
-    logger.info("Running canary (%d iters): %s", canary_iters, " ".join(cmd))
-    returncode, peak_gb, killed = run_with_memory_guard(cmd, poll_seconds)
+    cmd = _runner_cmd(canary_config_path, backend)
+    logger.info("Running canary (%d iters, %s): %s", canary_iters, backend, " ".join(cmd))
+    returncode, peak_gb, killed = run_with_memory_guard(
+        cmd, poll_seconds, env=_training_env(args)
+    )
 
     if peak_gb is None:
         logger.warning("No footprint samples collected during canary run")
@@ -495,7 +564,8 @@ def report_canary_result(peak_gb: float, canary_row_count: int, shortest_canary_
     print(f"Canary peak RSS: {peak_gb:.2f} GB")
     print(
         f"oMLX ceiling on this M3: soft={OMLX_SOFT_LIMIT_GB}GB "
-        f"hard={OMLX_HARD_LIMIT_GB}GB ceil={OMLX_CEILING_GB}GB"
+        f"hard={OMLX_HARD_LIMIT_GB}GB wired={OMLX_CEILING_GB:.2f}GB "
+        f"(sysctl iogpu.wired_limit_mb={OMLX_WIRED_LIMIT_MB})"
     )
     if peak_gb >= OMLX_HARD_LIMIT_GB:
         print(
@@ -519,6 +589,13 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.backend == "mlx-lm-lora" and args.max_seq_length > 4096:
+        logger.warning(
+            "max_seq_length=%d with mlx-lm-lora often exceeds the wired footprint limit "
+            "on CoPaw worst-case examples. If the canary fails, use --backend manual or "
+            "lower --max-seq-length.",
+            args.max_seq_length,
+        )
 
     pipeline_root = Path(args.pipeline_root)
     build_sft, _schema = load_pipeline_modules(pipeline_root)
@@ -617,16 +694,31 @@ def main(argv: list[str] | None = None) -> int:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
-    print(f"Wrote LoRA config to {config_path} (iters={config['iters']}, ~{args.epochs} epochs)")
+    print(
+        f"Wrote LoRA config to {config_path} "
+        f"(backend={args.backend}, iters={config['iters']}, ~{args.epochs} epochs)"
+    )
+    if args.backend == "mlx-lm-lora":
+        print(
+            f"mlx-lm-lora: efficient_long_context={args.efficient_long_context}, "
+            f"grad_checkpoint={args.grad_checkpoint}"
+        )
 
     if args.dry_run:
-        print("Dry run: skipping mlx_lm.lora invocation")
+        print(f"Dry run: skipping training ({args.backend})")
         return 0
 
     if args.canary_only:
         canary_rows = longest_rows(train_rows, tokenizer, args.canary_iters)
         shortest_canary_tokens = token_length(tokenizer, canary_rows[-1]["text"])
-        peak_gb = run_canary(config_path, canary_rows, args.canary_iters, args.canary_poll_seconds)
+        peak_gb = run_canary(
+            config_path,
+            canary_rows,
+            args.canary_iters,
+            args.canary_poll_seconds,
+            args.backend,
+            args,
+        )
         if peak_gb is None:
             logger.error("Canary run did not complete -- see errors above")
             return 1
@@ -634,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Canary-only: not running the full training. Re-run without --canary-only once satisfied.")
         return 0
 
-    return run_training(config_path)
+    return run_training(config_path, args.backend, args)
 
 
 if __name__ == "__main__":
