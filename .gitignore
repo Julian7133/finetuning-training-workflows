@@ -1,2 +1,6 @@
 __pycache__/
 .DS_Store
+
+# Training artifacts (generated locally — includes large adapter weights)
+output/
+*.safetensors
