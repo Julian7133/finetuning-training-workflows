@@ -36,3 +36,5 @@ python reproduce_dpo_qwen3.py --max-seq-length 4096 --skip-merge
 | `manual` | `train_runner.py` | Required for 8192-token worst-case on 24GB M3 (GatedDeltaNet manual BPTT). Slower (~90s/iter) but memory-safe. |
 
 See [`finetuning_runbook.ipynb`](finetuning_runbook.ipynb) for the full runbook.
+
+This is mostly for running training on Macbook M3 (24GB Memory) as a test. So far output is good but training takes too long (as expected).
