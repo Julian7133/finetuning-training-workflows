@@ -1,0 +1,4 @@
+mlx-lm-lora>=2.1.0
+mlx-lm
+pyyaml
+datasets>=2.0.0

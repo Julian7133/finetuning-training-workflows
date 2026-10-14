@@ -54,13 +54,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-GB = 1024**3
-
-# Hard cap on what may be wired: comfortably below the oMLX hard threshold
-# (19.9GB) and the sysctl-raised iogpu wired limit (22GB).
-WIRED_CAP_BYTES = int(14.0 * GB)
-
-CACHE_LIMIT_BYTES = int(2 * GB)
+from mem_guard import CACHE_LIMIT_BYTES, GB, install_wired_limit_clamp
 
 # Timesteps per BPTT chunk of the deltanet recurrence. Peak per chunk ~=
 # DELTA_CHUNK * ~3 * 2.1MB fp32 state-sized buffers.
@@ -72,15 +66,6 @@ CE_CHUNK = 1024
 # Set during no-grad forward passes so GatedDeltaNet uses the fused kernel
 # even though module.training is True.
 _FORCE_KERNEL = False
-
-
-def _install_wired_limit_clamp():
-    orig = mx.set_wired_limit
-
-    def capped(limit):
-        return orig(min(int(limit), WIRED_CAP_BYTES))
-
-    mx.set_wired_limit = capped
 
 
 def _install_gated_delta_patch():
@@ -191,10 +176,7 @@ def _chunk_scan_fast(state, q_c, k_c, v_c, g_c, beta_c):
 
 
 def _scan_chunk_grads(st, q_c, k_c, v_c, g_c, b_c, dy_c, dstate):
-    def f(st, q_c, k_c, v_c, g_c, b_c):
-        return _chunk_scan_fast(st, q_c, k_c, v_c, g_c, b_c)
-
-    _, grads = mx.vjp(f, [st, q_c, k_c, v_c, g_c, b_c], [dy_c, dstate])
+    _, grads = mx.vjp(_chunk_scan_fast, [st, q_c, k_c, v_c, g_c, b_c], [dy_c, dstate])
     return tuple(grads)
 
 
@@ -316,14 +298,17 @@ def _delta_layer_backward(layer, x, dout, keys, params):
     Tp = T + pad
     starts = list(range(0, Tp, DELTA_CHUNK))
 
-    # y for g2's backward: ONE full-length kernel call. Boundary states: one
-    # chained chunkwise graph (matmuls only, ~12MB transient per chunk), one
-    # eval for all of them. Per-chunk evals are no longer needed for memory
-    # -- the chunkwise formulation shrank chunk graphs from ~1GB to ~20MB --
-    # and dropping ~770 pipeline drains per iteration is the speed win.
+    # y for g2's backward: ops scan (matches phase F on manual_linear layers).
     state0 = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-    y, _ = gd.gated_delta_kernel(q, k, v, g, beta, state0, None)
-    y = y[:, :T]
+    y_parts = []
+    st = state0
+    for s in starts:
+        e = s + DELTA_CHUNK
+        y_c, st = _chunk_scan_fast(
+            st, q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], beta[:, s:e]
+        )
+        y_parts.append(y_c)
+    y = mx.concatenate(y_parts, axis=1)[:, :T]
 
     bounds = [state0]
     st = state0
@@ -427,16 +412,34 @@ def manual_loss_and_grads(model, batch, lengths):
     L = targets.shape[1]
     fa_mask = "causal" if inputs.shape[1] > 1 else None
 
-    # ---- Phase F: forward with kernel scans, eval-bounded per layer
+    trainable_idx = [
+        i for i, l in enumerate(tm.layers) if _flat_trainables(l)[0]
+    ]
+    lowest = min(trainable_idx) if trainable_idx else len(tm.layers)
+    # Phase B backprops through g1/scan/g2 ops math on linear layers. Phase F
+    # must use the same recurrence for those layers, not the inference kernel,
+    # or CE is evaluated on kernel hidden states while grads follow ops -> NaN.
+    manual_linear = {
+        i
+        for i in range(lowest, len(tm.layers))
+        if tm.layers[i].is_linear
+    }
+
+    # ---- Phase F: forward, eval-bounded per layer
     h = tm.embed_tokens(inputs)
     mx.eval(h)
     layer_inputs = []
     _FORCE_KERNEL = True
     try:
-        for layer in tm.layers:
+        for i, layer in enumerate(tm.layers):
             layer_inputs.append(h)
             mask = None if layer.is_linear else fa_mask
-            h = layer(h, mask=mask, cache=None)
+            if i in manual_linear:
+                _FORCE_KERNEL = False
+                h = layer(h, mask=mask, cache=None)
+                _FORCE_KERNEL = True
+            else:
+                h = layer(h, mask=mask, cache=None)
             mx.eval(h)
     finally:
         _FORCE_KERNEL = False
@@ -471,11 +474,6 @@ def manual_loss_and_grads(model, batch, lengths):
     # ---- Phase B: layers in reverse, eval-bounded per layer/chunk.
     # Everything below the lowest layer with trainable params is frozen
     # (including the embedding), so gradients there are useless -- stop.
-    trainable_idx = [
-        i for i, l in enumerate(tm.layers) if _flat_trainables(l)[0]
-    ]
-    lowest = min(trainable_idx) if trainable_idx else len(tm.layers)
-
     grads: dict[str, mx.array] = {}
     for i in reversed(range(lowest, len(tm.layers))):
         layer = tm.layers[i]
@@ -595,6 +593,14 @@ def manual_train(
         tic = time.perf_counter()
         lvalue, toks, grads = manual_loss_and_grads(model, *batch)
 
+        if not (mx.isfinite(lvalue).all().item() and all(
+            mx.isfinite(g).all().item() for g in grads.values()
+        )):
+            raise RuntimeError(
+                f"Non-finite loss/grads at iter {it} — stopping before corrupting "
+                "adapter weights. Report this with the current batch/seed."
+            )
+
         if acc is None:
             acc = grads
         else:
@@ -679,7 +685,7 @@ def _install_trainer_hooks():
 
 
 def install_all_patches():
-    _install_wired_limit_clamp()
+    install_wired_limit_clamp()
     _install_gated_delta_patch()
 
 
