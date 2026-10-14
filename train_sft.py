@@ -106,8 +106,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="grad_checkpoint",
         action="store_true",
         default=None,
-        help="Gradient checkpointing. Default: off for mlx-lm-lora (uses efficient long "
-        "context instead), on for manual backend.",
+        help="Gradient checkpointing. Default: on for both backends (combined with "
+        "--efficient-long-context on mlx-lm-lora; see Quick start in README).",
     )
     parser.add_argument("--no-grad-checkpoint", dest="grad_checkpoint", action="store_false")
     parser.add_argument(

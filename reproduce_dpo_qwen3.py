@@ -28,8 +28,7 @@ from mlx_lm_lora.trainer.datasets import CacheDataset, PreferenceDataset
 from mlx_lm_lora.trainer.dpo_trainer import DPOTrainingArgs, train_dpo
 from mlx_lm_lora.utils import calculate_iters, from_pretrained, save_pretrained_merged
 
-GB = 1024**3
-WIRED_CAP_BYTES = int(14.0 * GB)
+from mem_guard import CACHE_LIMIT_BYTES, GB, install_wired_limit_clamp
 
 MODEL_NAME = "Goekdeniz-Guelmez/Qwen3-4B-Instruct-2507-gabliterated"
 DATASET_NAME = "mlx-community/Josiefied-Qwen3-dpo-v1-flat"
@@ -63,11 +62,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _clamp_wired_limit() -> None:
-    orig = mx.set_wired_limit
-    mx.set_wired_limit = lambda limit: orig(min(int(limit), WIRED_CAP_BYTES))
-
-
 def preference_format(sample, tokenizer):
     prompt = sample["prompt"]
     chosen = sample["chosen"]
@@ -95,8 +89,8 @@ def preference_format(sample, tokenizer):
 
 def main() -> int:
     args = parse_args()
-    _clamp_wired_limit()
-    mx.set_cache_limit(int(2 * GB))
+    install_wired_limit_clamp()
+    mx.set_cache_limit(CACHE_LIMIT_BYTES)
 
     lora_config = {
         "rank": 12,

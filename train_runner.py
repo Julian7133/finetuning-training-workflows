@@ -54,13 +54,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-GB = 1024**3
-
-# Hard cap on what may be wired: comfortably below the oMLX hard threshold
-# (19.9GB) and the sysctl-raised iogpu wired limit (22GB).
-WIRED_CAP_BYTES = int(14.0 * GB)
-
-CACHE_LIMIT_BYTES = int(2 * GB)
+from mem_guard import CACHE_LIMIT_BYTES, GB, install_wired_limit_clamp
 
 # Timesteps per BPTT chunk of the deltanet recurrence. Peak per chunk ~=
 # DELTA_CHUNK * ~3 * 2.1MB fp32 state-sized buffers.
@@ -72,15 +66,6 @@ CE_CHUNK = 1024
 # Set during no-grad forward passes so GatedDeltaNet uses the fused kernel
 # even though module.training is True.
 _FORCE_KERNEL = False
-
-
-def _install_wired_limit_clamp():
-    orig = mx.set_wired_limit
-
-    def capped(limit):
-        return orig(min(int(limit), WIRED_CAP_BYTES))
-
-    mx.set_wired_limit = capped
 
 
 def _install_gated_delta_patch():
@@ -191,10 +176,7 @@ def _chunk_scan_fast(state, q_c, k_c, v_c, g_c, beta_c):
 
 
 def _scan_chunk_grads(st, q_c, k_c, v_c, g_c, b_c, dy_c, dstate):
-    def f(st, q_c, k_c, v_c, g_c, b_c):
-        return _scan_chunk(st, q_c, k_c, v_c, g_c, b_c, None)
-
-    _, grads = mx.vjp(f, [st, q_c, k_c, v_c, g_c, b_c], [dy_c, dstate])
+    _, grads = mx.vjp(_chunk_scan_fast, [st, q_c, k_c, v_c, g_c, b_c], [dy_c, dstate])
     return tuple(grads)
 
 
@@ -322,8 +304,8 @@ def _delta_layer_backward(layer, x, dout, keys, params):
     st = state0
     for s in starts:
         e = s + DELTA_CHUNK
-        y_c, st = _scan_chunk(
-            st, q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], beta[:, s:e], None
+        y_c, st = _chunk_scan_fast(
+            st, q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], beta[:, s:e]
         )
         y_parts.append(y_c)
     y = mx.concatenate(y_parts, axis=1)[:, :T]
@@ -332,8 +314,8 @@ def _delta_layer_backward(layer, x, dout, keys, params):
     st = state0
     for s in starts[:-1]:
         e = s + DELTA_CHUNK
-        _, st = _scan_chunk(
-            st, q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], beta[:, s:e], None
+        _, st = _chunk_scan_fast(
+            st, q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], beta[:, s:e]
         )
         bounds.append(st)
     mx.eval(y, *bounds)
@@ -703,7 +685,7 @@ def _install_trainer_hooks():
 
 
 def install_all_patches():
-    _install_wired_limit_clamp()
+    install_wired_limit_clamp()
     _install_gated_delta_patch()
 
 

@@ -15,19 +15,9 @@ import sys
 
 import mlx.core as mx
 
-GB = 1024**3
-WIRED_CAP_BYTES = int(14.0 * GB)
-CACHE_LIMIT_BYTES = int(2 * GB)
+from mem_guard import CACHE_LIMIT_BYTES, install_wired_limit_clamp
+
 DEFAULT_SEQ_STEP = int(os.environ.get("COPAW_SEQ_STEP_SIZE", "512"))
-
-
-def _install_wired_limit_clamp() -> None:
-    orig = mx.set_wired_limit
-
-    def capped(limit):
-        return orig(min(int(limit), WIRED_CAP_BYTES))
-
-    mx.set_wired_limit = capped
 
 
 def _seq_step_for(args) -> int:
@@ -68,7 +58,7 @@ def _patch_efficient_seq_step() -> None:
 
 
 def main() -> int:
-    _install_wired_limit_clamp()
+    install_wired_limit_clamp()
     mx.set_cache_limit(CACHE_LIMIT_BYTES)
     _patch_efficient_seq_step()
 
